@@ -32,7 +32,8 @@
     fetchError: "",
     mockData: new Map(),
     mockDefinitions: new Map(),
-    simpleJson: new Map()
+    simpleJson: new Map(),
+    schemaSearch: new Map()
   };
 
   const checkSvg = '<svg class="h-3 w-3" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 10.5 8.2 14 15 6.5"/></svg>';
@@ -223,6 +224,7 @@
     S.spec = obj;
     S.endpoints = [];
     S.openSchemas = new Set();
+    S.schemaSearch = new Map();
     S.mockData = new Map();
     S.mockDefinitions = new Map();
     S.simpleJson = new Map();
@@ -260,12 +262,12 @@
       const open = S.openSchemas.has(key);
       const domId = schemaDomId(key);
 
-      return `<div class="border-b border-slate-200 last:border-0 dark:border-slate-800/70">
-        <div class="flex gap-2 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/30" style="padding-left:${16 + level * 18}px">
+      return `<div data-schema-row data-key-name="${esc(name)}" class="schema-row border-b border-slate-200 last:border-0 dark:border-slate-800/70">
+        <div class="schema-row-main flex gap-2 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/30" style="padding-left:${16 + level * 18}px">
           ${nested ? `<button type="button" data-key="${esc(key)}" data-target="${domId}" onclick="toggleSchema(this)" aria-expanded="${open ? "true" : "false"}" title="${open ? "Collapse object" : "Expand object"}" class="schema-toggle mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-400 shadow-sm hover:border-blue-400 hover:text-blue-500 dark:border-slate-700 dark:bg-slate-800${open ? " is-open" : ""}">${chevronSvg}</button>` : `<span class="w-5 shrink-0"></span>`}
           <div class="min-w-0 flex-1">
             <div class="flex flex-wrap items-center gap-2">
-              <code class="text-sm">${esc(name)}</code>
+              <code class="schema-key text-sm">${esc(name)}</code>
               ${req.has(name) ? '<span class="text-[10px] font-semibold text-red-400">required</span>' : ""}
               ${x?.nullable ? '<span class="text-[10px] text-slate-500">nullable</span>' : ""}
               ${nested ? `<span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800">${fieldCount} fields</span>` : ""}
@@ -284,19 +286,25 @@
     return `<button type="button" data-json-key="${esc(key)}" onclick="copySimpleJson(this.dataset.jsonKey)" class="ml-auto rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">${esc(label)}</button>`;
   }
 
-  function schemaCard(title, schema, path) {
+  function schemaSearchInput(path) {
+    const value = S.schemaSearch.get(path) ?? "";
+    return `<input type="search" value="${esc(value)}" data-schema-search="${esc(path)}" oninput="filterSchema(this)" placeholder="Search keys" aria-label="Search keys" autocomplete="off" spellcheck="false" class="h-7 w-36 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-blue-500 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200">`;
+  }
+
+  function schemaCard(title, schema, path, showSearch = true) {
     const label = typeOf(schema);
     const resolved = nestedSchema(schema) ?? deref(schema);
     if (!resolved) return "";
     const props = Object.keys(resolved.properties ?? {});
     const copyKey = path + ":shape";
     S.simpleJson.set(copyKey, window.ApiMock.shape(schema, S.spec));
-    return `<section class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
-      <div class="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+    return `<section data-schema-scope="${esc(path)}" class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
+      <div class="flex items-center gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
         <h3 class="text-sm font-semibold">${esc(title)}</h3>
-        <div class="flex items-center gap-2"><code class="text-[11px] text-cyan-600 dark:text-cyan-300">${esc(label)}</code>${copyJsonButton(copyKey, "Copy keys & types")}</div>
+        ${props.length && showSearch ? schemaSearchInput(path) : ""}
+        <div class="ml-auto flex items-center gap-2"><code class="text-[11px] text-cyan-600 dark:text-cyan-300">${esc(label)}</code>${copyJsonButton(copyKey, "Copy keys & types")}</div>
       </div>
-      ${props.length ? schemaRows(resolved, 0, path) : `<div class="p-4">${resolved.enum ? `<div class="flex flex-wrap gap-2">${resolved.enum.map(v => `<span class="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : `<pre class="scroll overflow-auto text-xs text-slate-500">${esc(JSON.stringify(deref(schema) ?? resolved, null, 2))}</pre>`}</div>`}
+      ${props.length ? `<div data-schema-rows>${schemaRows(resolved, 0, path)}</div><div data-schema-empty hidden class="px-4 py-3 text-xs text-slate-500">No matching keys</div>` : `<div class="p-4">${resolved.enum ? `<div class="flex flex-wrap gap-2">${resolved.enum.map(v => `<span class="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : `<pre class="scroll overflow-auto text-xs text-slate-500">${esc(JSON.stringify(deref(schema) ?? resolved, null, 2))}</pre>`}</div>`}
     </section>`;
   }
 
@@ -368,15 +376,19 @@
         in: "header"
       }));
       const good = String(code).startsWith("2");
-      return `<div class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
+      const schemaPath = endpointId + ":response:" + code;
+      const resolvedSchema = schema ? (nestedSchema(schema) ?? deref(schema)) : null;
+      const searchable = Object.keys(resolvedSchema?.properties ?? {}).length > 0;
+      return `<div data-schema-scope="${esc(schemaPath)}" class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
         <div class="flex items-center gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
           <span class="rounded-md px-2 py-1 font-mono text-xs font-semibold ${good ? "bg-emerald-500/15 text-emerald-500" : "bg-amber-500/15 text-amber-500"}">${esc(code)}</span>
-          <span class="text-sm text-slate-500">${esc(r?.description ?? "")}</span>
-          <span class="ml-auto text-[11px] text-slate-400">${esc(first?.[0] ?? "")}</span>
+          ${searchable ? schemaSearchInput(schemaPath) : ""}
+          <span class="min-w-0 flex-1 truncate text-sm text-slate-500">${esc(r?.description ?? "")}</span>
+          <span class="text-[11px] text-slate-400">${esc(first?.[0] ?? "")}</span>
         </div>
         <div class="space-y-3 p-3">
           ${parameterSection("Response headers", responseHeaders, endpointId + ":response-headers:" + code)}
-          ${schema ? schemaCard("Response schema", schema, endpointId + ":response:" + code) : ""}
+          ${schema ? schemaCard("Response schema", schema, schemaPath, false) : ""}
           ${mockCard("Mock response · " + code, endpointId + ":response-mock:" + code, schema, example, "response")}
         </div>
       </div>`;
@@ -704,6 +716,7 @@
     if (side) side.scrollTop = sideScroll;
     const mainEl = document.querySelector("main.scroll");
     if (mainEl) mainEl.scrollTop = mainScroll;
+    applySchemaSearches();
   }
 
   window.updateRemoteField = (field, value) => {
@@ -740,11 +753,132 @@
     }
   };
 
+  function schemaRowInner(row) {
+    return row.querySelector(":scope > .schema-children > .schema-children-inner");
+  }
+
+  function setFilterOpen(row, open) {
+    const box = row.querySelector(":scope > .schema-children");
+    const button = row.querySelector(":scope > .schema-row-main .schema-toggle");
+    box?.classList.toggle("is-filter-open", open);
+    button?.classList.toggle("is-filter-open", open);
+    if (!button) return;
+    const expanded = open || button.classList.contains("is-open");
+    button.setAttribute("aria-expanded", expanded ? "true" : "false");
+    button.title = expanded ? "Collapse object" : "Expand object";
+  }
+
+  function paintKey(row, query) {
+    const code = row.querySelector(":scope > .schema-row-main .schema-key");
+    if (!code) return;
+    const name = row.dataset.keyName ?? "";
+    if (!query) {
+      code.textContent = name;
+      return;
+    }
+    const index = name.toLowerCase().indexOf(query);
+    if (index < 0) {
+      code.textContent = name;
+      return;
+    }
+    const mark = document.createElement("mark");
+    mark.className = "schema-key-mark";
+    mark.textContent = name.slice(index, index + query.length);
+    code.replaceChildren(document.createTextNode(name.slice(0, index)), mark, document.createTextNode(name.slice(index + query.length)));
+  }
+
+  function showSchemaTree(row, query) {
+    row.classList.remove("is-filter-hidden");
+    paintKey(row, query);
+    const inner = schemaRowInner(row);
+    if (!inner) return;
+    for (const child of inner.querySelectorAll(":scope > [data-schema-row]")) {
+      setFilterOpen(child, false);
+      showSchemaTree(child, query);
+    }
+  }
+
+  function filterSchemaRows(container, query) {
+    let any = false;
+    for (const row of container.querySelectorAll(":scope > [data-schema-row]")) {
+      const name = (row.dataset.keyName ?? "").toLowerCase();
+      if (name.includes(query)) {
+        showSchemaTree(row, query);
+        setFilterOpen(row, Boolean(schemaRowInner(row)));
+        any = true;
+        continue;
+      }
+      const inner = schemaRowInner(row);
+      const childMatch = inner ? filterSchemaRows(inner, query) : false;
+      row.classList.toggle("is-filter-hidden", !childMatch);
+      setFilterOpen(row, childMatch);
+      paintKey(row, query);
+      if (childMatch) any = true;
+    }
+    return any;
+  }
+
+  function clearSchemaFilter(scope) {
+    scope.querySelectorAll("[data-schema-row]").forEach(row => {
+      row.classList.remove("is-filter-hidden");
+      setFilterOpen(row, false);
+      paintKey(row, "");
+    });
+    const empty = scope.querySelector("[data-schema-empty]");
+    if (empty) empty.hidden = true;
+  }
+
+  const schemaSearchDelay = 150;
+  const schemaSearchTimers = new Map();
+
+  function rememberSchemaSearch(input) {
+    const path = input.dataset.schemaSearch ?? "";
+    const query = input.value.trim().toLowerCase();
+    if (query) S.schemaSearch.set(path, input.value);
+    else S.schemaSearch.delete(path);
+    return query;
+  }
+
+  function applySchemaFilter(input) {
+    const query = input.value.trim().toLowerCase();
+    const scope = input.closest("[data-schema-scope]");
+    const rows = scope?.querySelector("[data-schema-rows]");
+    if (!scope || !rows) return;
+    clearSchemaFilter(scope);
+    if (!query) return;
+    const any = filterSchemaRows(rows, query);
+    const empty = scope.querySelector("[data-schema-empty]");
+    if (empty) empty.hidden = any;
+  }
+
+  window.filterSchema = input => {
+    const path = input.dataset.schemaSearch ?? "";
+    rememberSchemaSearch(input);
+    const pending = schemaSearchTimers.get(path);
+    if (pending) clearTimeout(pending);
+    schemaSearchTimers.set(path, setTimeout(() => {
+      schemaSearchTimers.delete(path);
+      const live = input.isConnected ? input : document.querySelector(`[data-schema-search="${CSS.escape(path)}"]`);
+      if (live) applySchemaFilter(live);
+    }, schemaSearchDelay));
+  };
+
+  function applySchemaSearches() {
+    schemaSearchTimers.forEach(timer => clearTimeout(timer));
+    schemaSearchTimers.clear();
+    document.querySelectorAll("[data-schema-search]").forEach(input => {
+      if (input.value.trim()) applySchemaFilter(input);
+    });
+  }
+
   window.toggleSchema = button => {
     const el = document.getElementById(button.dataset.target);
     const key = button.dataset.key;
     if (!el || !key) return;
-    const open = !S.openSchemas.has(key);
+    const filterOpen = el.classList.contains("is-filter-open");
+    el.classList.remove("is-filter-open");
+    button.classList.remove("is-filter-open");
+    const open = !(S.openSchemas.has(key) || filterOpen);
     if (open) S.openSchemas.add(key);
     else S.openSchemas.delete(key);
     el.classList.toggle("is-open", open);
