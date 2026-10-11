@@ -129,12 +129,31 @@
     if (schema.properties && Object.keys(schema.properties).length) return schema;
     return null;
   }
-  function nestedSchema(schema) {
+  function isNullSchema(schema) {
+    const resolved = deref(schema);
+    if (!resolved || typeof resolved !== "object") return false;
+    if (resolved.type === "null") return true;
+    if (Array.isArray(resolved.type) && resolved.type.length > 0 && resolved.type.every(type => type === "null")) return true;
+    return resolved.const === null;
+  }
+  function nestedSchema(schema, seen = new Set()) {
+    const refKey = schema?.$ref;
+    if (refKey) {
+      if (seen.has(refKey)) return null;
+      seen = new Set([...seen, refKey]);
+    }
     const resolved = deref(schema);
     if (!resolved || typeof resolved !== "object") return null;
     const direct = mergedObject(resolved);
     if (direct) return direct;
-    if (resolved.type === "array" || resolved.items) return mergedObject(resolved.items);
+    if (resolved.type === "array" || resolved.items) return nestedSchema(resolved.items, seen);
+    const branches = resolved.anyOf ?? resolved.oneOf;
+    if (!branches?.length) return null;
+    for (const branch of branches) {
+      if (isNullSchema(branch)) continue;
+      const nested = nestedSchema(branch, seen);
+      if (nested) return nested;
+    }
     return null;
   }
   function baseUrl() {
@@ -267,9 +286,9 @@
 
   function schemaCard(title, schema, path) {
     const label = typeOf(schema);
-    schema = deref(schema);
-    if (!schema) return "";
-    const props = Object.keys(schema.properties ?? {});
+    const resolved = nestedSchema(schema) ?? deref(schema);
+    if (!resolved) return "";
+    const props = Object.keys(resolved.properties ?? {});
     const copyKey = path + ":shape";
     S.simpleJson.set(copyKey, window.ApiMock.shape(schema, S.spec));
     return `<section class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
@@ -277,7 +296,7 @@
         <h3 class="text-sm font-semibold">${esc(title)}</h3>
         <div class="flex items-center gap-2"><code class="text-[11px] text-cyan-600 dark:text-cyan-300">${esc(label)}</code>${copyJsonButton(copyKey, "Copy keys & types")}</div>
       </div>
-      ${props.length ? schemaRows(schema, 0, path) : `<div class="p-4">${schema.enum ? `<div class="flex flex-wrap gap-2">${schema.enum.map(v => `<span class="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : `<pre class="scroll overflow-auto text-xs text-slate-500">${esc(JSON.stringify(schema, null, 2))}</pre>`}</div>`}
+      ${props.length ? schemaRows(resolved, 0, path) : `<div class="p-4">${resolved.enum ? `<div class="flex flex-wrap gap-2">${resolved.enum.map(v => `<span class="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : `<pre class="scroll overflow-auto text-xs text-slate-500">${esc(JSON.stringify(deref(schema) ?? resolved, null, 2))}</pre>`}</div>`}
     </section>`;
   }
 

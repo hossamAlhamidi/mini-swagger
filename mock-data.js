@@ -73,8 +73,11 @@
       }
       return values.find(value => value !== null) ?? null;
     }
-    if (schema.oneOf?.length) return generate(schema.oneOf[0], spec, { ...options, depth: depth + 1, seen, example: undefined });
-    if (schema.anyOf?.length) return generate(schema.anyOf[0], spec, { ...options, depth: depth + 1, seen, example: undefined });
+    const branches = schema.anyOf ?? schema.oneOf;
+    if (branches?.length) {
+      const branch = branches.find(item => !isNullSchema(item)) ?? branches[0];
+      return generate(branch, spec, { ...options, depth: depth + 1, seen, example: undefined });
+    }
 
     const inferredType = schema.type || (schema.properties ? "object" : schema.items ? "array" : null);
     if (inferredType === "object") {
@@ -136,6 +139,13 @@
     return schema.format ? `${type} (${schema.format})` : type;
   }
 
+  function isNullSchema(schema) {
+    if (!schema || typeof schema !== "object") return false;
+    if (schema.type === "null") return true;
+    if (Array.isArray(schema.type) && schema.type.length > 0 && schema.type.every(type => type === "null")) return true;
+    return schema.const === null;
+  }
+
   function shape(schema, spec, seen = new Set()) {
     if (!schema || typeof schema !== "object") return "unknown";
     if (schema.$ref) {
@@ -146,6 +156,14 @@
     if (schema.allOf?.length) {
       const parts = schema.allOf.map(item => shape(item, spec, seen));
       if (parts.every(part => part && typeof part === "object" && !Array.isArray(part))) return Object.assign({}, ...parts);
+    }
+    const branches = schema.anyOf ?? schema.oneOf;
+    if (branches?.length) {
+      for (const branch of branches) {
+        if (isNullSchema(branch)) continue;
+        const shaped = shape(branch, spec, seen);
+        if (shaped && typeof shaped === "object") return shaped;
+      }
     }
     if (schema.type === "array" || (schema.items && !schema.properties)) {
       const itemShape = shape(schema.items ?? {}, spec, seen);
