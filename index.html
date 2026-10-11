@@ -1,0 +1,963 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>API Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: "class" };
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="h-full bg-slate-950 text-slate-100">
+<div id="app" class="h-full"></div>
+
+<script src="mock-data.js"></script>
+<script>
+(() => {
+  const storedWidth = Number(localStorage.getItem("api-viewer-sidebar"));
+  const storedSpecUrl = localStorage.getItem("openapi-url") ?? "";
+  const S = {
+    spec: null,
+    endpoints: [],
+    selected: [],
+    focusId: null,
+    openSchemas: new Set(),
+    search: "",
+    theme: localStorage.getItem("api-viewer-theme") ?? "dark",
+    sidebarWidth: Number.isFinite(storedWidth) && storedWidth > 0 ? storedWidth : 330,
+    remote: { url: storedSpecUrl, username: "", password: "" },
+    fetching: false,
+    fetchError: "",
+    mockData: new Map(),
+    mockDefinitions: new Map(),
+    simpleJson: new Map()
+  };
+
+  const checkSvg = '<svg class="h-3 w-3" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 10.5 8.2 14 15 6.5"/></svg>';
+  const copySvg = '<svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7.25" y="7.25" width="9" height="9" rx="1.5"/><path d="M5.75 12.75H4.75A1.5 1.5 0 0 1 3.25 11.25v-7A1.5 1.5 0 0 1 4.75 2.75h7A1.5 1.5 0 0 1 13.25 4.25v1"/></svg>';
+  const chevronSvg = '<svg class="chevron h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8l4 4 4-4"/></svg>';
+
+  const esc = x => String(x ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const methods = {
+    get: "bg-emerald-500/15 text-emerald-400 border-emerald-500/20",
+    post: "bg-blue-500/15 text-blue-400 border-blue-500/20",
+    put: "bg-amber-500/15 text-amber-400 border-amber-500/20",
+    patch: "bg-violet-500/15 text-violet-400 border-violet-500/20",
+    delete: "bg-red-500/15 text-red-400 border-red-500/20",
+    options: "bg-cyan-500/15 text-cyan-400 border-cyan-500/20",
+    head: "bg-slate-500/15 text-slate-400 border-slate-500/20"
+  };
+  const badge = m => `<span class="inline-flex min-w-[54px] justify-center rounded-md border px-2 py-1 text-[10px] font-bold tracking-wide ${methods[m] || methods.get}">${m.toUpperCase()}</span>`;
+
+  function clampWidth(n) {
+    const value = Number.isFinite(n) ? n : 330;
+    const max = Math.min(720, Math.max(200, window.innerWidth - 320));
+    return Math.round(Math.min(Math.max(value, 200), max));
+  }
+  function panelId(id) {
+    return "ep-" + S.endpoints.findIndex(e => e.id === id);
+  }
+  function schemaDomId(key) {
+    return "sch-" + encodeURIComponent(key).replace(/%/g, "_");
+  }
+  function syncSidebarWidth() {
+    const aside = document.getElementById("sidebar");
+    if (aside) aside.style.width = clampWidth(S.sidebarWidth) + "px";
+  }
+
+  function ref(r) {
+    if (!r?.startsWith("#/") || !S.spec) return null;
+    return r.slice(2).split("/").reduce((o, k) => o?.[k.replace(/~1/g, "/").replace(/~0/g, "~")], S.spec);
+  }
+  function deref(x, seen = new Set()) {
+    if (!x || typeof x !== "object") return x;
+    if (x.$ref) {
+      if (seen.has(x.$ref)) return { type: "object", description: "Circular reference" };
+      const t = ref(x.$ref);
+      return t ? deref(t, new Set([...seen, x.$ref])) : x;
+    }
+    return x;
+  }
+  function refName(schema) {
+    if (!schema || typeof schema !== "object") return "";
+    if (schema.$ref) return schemaName(schema.$ref);
+    if (schema.allOf?.length === 1 && !schema.properties && !schema.type) return refName(schema.allOf[0]);
+    return "";
+  }
+  function typeOf(x) {
+    if (!x || typeof x !== "object") return "unknown";
+    if (x.$ref) {
+      const name = schemaName(x.$ref);
+      const resolved = deref(x);
+      if (!resolved || resolved === x) return name;
+      if (resolved.type === "array" || (resolved.items && !resolved.properties)) return typeOf(resolved);
+      if (resolved.enum || resolved.oneOf || resolved.anyOf) return typeOf(resolved);
+      if (resolved.allOf && !resolved.properties && !resolved.type) return typeOf(resolved);
+      if (resolved.type && resolved.type !== "object" && !resolved.properties) return typeOf(resolved);
+      return name;
+    }
+    if (x.enum) return x.type || "enum";
+    if (x.oneOf) return x.oneOf.map(typeOf).join(" | ");
+    if (x.anyOf) return x.anyOf.map(typeOf).join(" | ");
+    if (x.allOf) return x.allOf.map(typeOf).join(" & ");
+    if (x.type === "array" || (x.items && !x.properties)) {
+      const name = refName(x.items);
+      return name ? `array<${name}>` : `array<${typeOf(x.items || {})}>`;
+    }
+    if (x.type) return x.format ? `${x.type} (${x.format})` : x.type;
+    if (x.properties) return "object";
+    return "unknown";
+  }
+  function mergedObject(schema, seen = new Set()) {
+    schema = deref(schema);
+    if (!schema || typeof schema !== "object" || Array.isArray(schema)) return null;
+    if (schema.allOf?.length) {
+      const properties = { ...(schema.properties ?? {}) };
+      const required = [...(schema.required ?? [])];
+      for (const part of schema.allOf) {
+        const key = part?.$ref;
+        if (key && seen.has(key)) continue;
+        const merged = mergedObject(part, key ? new Set([...seen, key]) : seen);
+        if (!merged?.properties) continue;
+        Object.assign(properties, merged.properties);
+        required.push(...(merged.required ?? []));
+      }
+      return Object.keys(properties).length ? { type: "object", properties, required } : null;
+    }
+    if (schema.properties && Object.keys(schema.properties).length) return schema;
+    return null;
+  }
+  function nestedSchema(schema) {
+    const resolved = deref(schema);
+    if (!resolved || typeof resolved !== "object") return null;
+    const direct = mergedObject(resolved);
+    if (direct) return direct;
+    if (resolved.type === "array" || resolved.items) return mergedObject(resolved.items);
+    return null;
+  }
+  function baseUrl() {
+    if (S.spec?.servers?.[0]?.url) return S.spec.servers[0].url.replace(/\/$/, "");
+    if (S.spec?.host) return `${S.spec.schemes?.[0] || "https"}://${S.spec.host}${S.spec.basePath || ""}`.replace(/\/$/, "");
+    return "";
+  }
+  function endpointUrl(e) {
+    return `${baseUrl()}${e.path}` || e.path;
+  }
+  function queryText(e) {
+    return `${e.path} ${e.method} ${e.op.summary ?? ""} ${e.op.description ?? ""} ${(e.op.tags ?? []).join(" ")}`.toLowerCase();
+  }
+  function groupedEndpoints() {
+    const q = S.search.toLowerCase();
+    const groups = {};
+    S.endpoints.filter(e => queryText(e).includes(q)).forEach(e => {
+      const tag = e.op.tags?.[0] || "Endpoints";
+      (groups[tag] ??= []).push(e);
+    });
+    return Object.entries(groups);
+  }
+  function visualEndpoints() {
+    return groupedEndpoints().flatMap(([, es]) => es);
+  }
+
+  function basicToken(username, password) {
+    const bytes = new TextEncoder().encode(`${username}:${password}`);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  async function fetchWithAuth(url, username, password) {
+    const headers = {};
+    if (username !== "" || password !== "") {
+      headers.authorization = `Basic ${basicToken(username, password)}`;
+    }
+    const res = await fetch(url, { headers, credentials: "omit" });
+    if (res.status !== 200) {
+      const hint = res.status === 401 || res.status === 403 ? " Check username and password." : "";
+      throw new Error(`Failed to fetch: ${res.status}.${hint}`);
+    }
+    return res.text();
+  }
+
+  function friendlyFetchError(error) {
+    if (error instanceof SyntaxError) return "The URL did not return valid JSON.";
+    if (error?.message === "Failed to fetch") {
+      return "Browser blocked the request (CORS). The API must allow this origin and the Authorization header, or open this page from the same host as the spec.";
+    }
+    return error?.message ?? "Could not fetch the spec.";
+  }
+
+  function syncRemoteFromForm() {
+    const form = document.getElementById("remote-form");
+    if (!form) return;
+    const data = new FormData(form);
+    S.remote.url = String(data.get("spec-url") ?? "").trim();
+    S.remote.username = String(data.get("username") ?? "");
+    S.remote.password = String(data.get("password") ?? "");
+  }
+
+  function load(obj) {
+    if (!obj || typeof obj !== "object") throw Error("Invalid JSON");
+    if (!obj.openapi && !obj.swagger) throw Error("This doesn't look like Swagger/OpenAPI JSON.");
+    S.spec = obj;
+    S.endpoints = [];
+    S.openSchemas = new Set();
+    S.mockData = new Map();
+    S.mockDefinitions = new Map();
+    S.simpleJson = new Map();
+    S.fetchError = "";
+    for (const [path, item] of Object.entries(obj.paths ?? {})) {
+      for (const method of ["get", "post", "put", "patch", "delete", "options", "head", "trace"]) {
+        if (item?.[method]) {
+          S.endpoints.push({
+            id: method + ":" + path,
+            path,
+            method,
+            op: item[method],
+            parameters: [...(item.parameters ?? []), ...(item[method].parameters ?? [])]
+          });
+        }
+      }
+    }
+    S.selected = S.endpoints[0] ? [S.endpoints[0].id] : [];
+    S.focusId = S.selected[0] ?? null;
+    render();
+  }
+
+  function schemaRows(schema, level = 0, path = "") {
+    schema = deref(schema);
+    if (!schema) return "";
+    const req = new Set(schema.required ?? []);
+    const props = schema.properties ?? {};
+
+    return Object.entries(props).map(([name, raw]) => {
+      const x = deref(raw);
+      const nestedSource = nestedSchema(raw);
+      const fieldCount = Object.keys(nestedSource?.properties ?? {}).length;
+      const nested = fieldCount > 0;
+      const key = path + "/" + name;
+      const open = S.openSchemas.has(key);
+      const domId = schemaDomId(key);
+
+      return `<div class="border-b border-slate-200 last:border-0 dark:border-slate-800/70">
+        <div class="flex gap-2 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/30" style="padding-left:${16 + level * 18}px">
+          ${nested ? `<button type="button" data-key="${esc(key)}" data-target="${domId}" onclick="toggleSchema(this)" aria-expanded="${open ? "true" : "false"}" title="${open ? "Collapse object" : "Expand object"}" class="schema-toggle mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-400 shadow-sm hover:border-blue-400 hover:text-blue-500 dark:border-slate-700 dark:bg-slate-800${open ? " is-open" : ""}">${chevronSvg}</button>` : `<span class="w-5 shrink-0"></span>`}
+          <div class="min-w-0 flex-1">
+            <div class="flex flex-wrap items-center gap-2">
+              <code class="text-sm">${esc(name)}</code>
+              ${req.has(name) ? '<span class="text-[10px] font-semibold text-red-400">required</span>' : ""}
+              ${x?.nullable ? '<span class="text-[10px] text-slate-500">nullable</span>' : ""}
+              ${nested ? `<span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800">${fieldCount} fields</span>` : ""}
+            </div>
+            ${x?.description ? `<p class="mt-1 text-xs text-slate-500">${esc(x.description)}</p>` : ""}
+            ${x?.enum ? `<div class="mt-2 flex flex-wrap gap-1.5">${x.enum.map(v => `<span class="rounded bg-slate-100 px-2 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : ""}
+          </div>
+          <code class="shrink-0 rounded bg-slate-100 px-2 py-1 text-[11px] text-cyan-600 dark:bg-slate-900 dark:text-cyan-300">${esc(typeOf(raw))}</code>
+        </div>
+        ${nested ? `<div id="${domId}" class="schema-children${open ? " is-open" : ""}"><div class="schema-children-inner">${schemaRows(nestedSource, level + 1, key)}</div></div>` : ""}
+      </div>`;
+    }).join("");
+  }
+
+  function copyJsonButton(key, label = "Copy") {
+    return `<button type="button" data-json-key="${esc(key)}" onclick="copySimpleJson(this.dataset.jsonKey)" class="ml-auto rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">${esc(label)}</button>`;
+  }
+
+  function schemaCard(title, schema, path) {
+    const label = typeOf(schema);
+    schema = deref(schema);
+    if (!schema) return "";
+    const props = Object.keys(schema.properties ?? {});
+    const copyKey = path + ":shape";
+    S.simpleJson.set(copyKey, window.ApiMock.shape(schema, S.spec));
+    return `<section class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
+      <div class="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+        <h3 class="text-sm font-semibold">${esc(title)}</h3>
+        <div class="flex items-center gap-2"><code class="text-[11px] text-cyan-600 dark:text-cyan-300">${esc(label)}</code>${copyJsonButton(copyKey, "Copy keys & types")}</div>
+      </div>
+      ${props.length ? schemaRows(schema, 0, path) : `<div class="p-4">${schema.enum ? `<div class="flex flex-wrap gap-2">${schema.enum.map(v => `<span class="rounded-md bg-slate-100 px-2.5 py-1 font-mono text-xs dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : `<pre class="scroll overflow-auto text-xs text-slate-500">${esc(JSON.stringify(schema, null, 2))}</pre>`}</div>`}
+    </section>`;
+  }
+
+  function mediaExample(media) {
+    if (!media) return undefined;
+    if (media.example !== undefined) return media.example;
+    const named = Object.values(media.examples ?? {})[0];
+    return named?.value;
+  }
+
+  function mockCard(title, key, schema, example, mode) {
+    if (!schema && example === undefined) return "";
+    S.mockDefinitions.set(key, { schema: schema ?? {}, example, mode });
+    if (!S.mockData.has(key)) S.mockData.set(key, generateMock(key));
+    const value = S.mockData.get(key);
+    return `<section class="overflow-hidden rounded-xl border border-blue-500/20 bg-blue-500/5">
+      <div class="flex flex-wrap items-center gap-2 px-4 py-3">
+        <div class="mr-auto">
+          <h3 class="text-sm font-semibold">${esc(title)}</h3>
+          <p class="mt-0.5 text-[11px] text-slate-500">Random values generated from field types</p>
+        </div>
+        <button type="button" data-mock-key="${esc(key)}" onclick="regenerateMock(this.dataset.mockKey)" class="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-500 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">Regenerate</button>
+        <button type="button" data-mock-key="${esc(key)}" onclick="copyMock(this.dataset.mockKey)" class="rounded-md bg-blue-600 px-2.5 py-1.5 text-[11px] font-medium text-white hover:bg-blue-500">Copy mock</button>
+      </div>
+      <details><summary class="cursor-pointer border-t border-blue-500/10 px-4 py-2 text-[11px] text-slate-500">Preview JSON</summary><pre class="scroll max-h-72 overflow-auto border-t border-blue-500/10 bg-slate-950 p-4 text-xs leading-5 text-emerald-300">${esc(JSON.stringify(value, null, 2))}</pre></details>
+    </section>`;
+  }
+
+  function parameterShape(list) {
+    return Object.fromEntries(list.map(raw => {
+      const parameter = deref(raw);
+      return [parameter?.name || "unknown", window.ApiMock.describe(deref(parameter?.schema) || parameter || {}, S.spec)];
+    }));
+  }
+
+  function parameterSection(title, ps, copyKey) {
+    if (!ps?.length) return "";
+    S.simpleJson.set(copyKey, parameterShape(ps));
+    return `<section><div class="mb-3 flex items-center"><h3 class="text-sm font-semibold">${esc(title)}</h3>${copyJsonButton(copyKey, "Copy keys & types")}</div>
+      <div class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
+      <div class="overflow-x-auto"><table class="w-full text-left text-sm"><thead class="border-b border-slate-200 text-[10px] uppercase tracking-wide text-slate-500 dark:border-slate-800">
+      <tr><th class="px-4 py-3">Name</th><th class="px-4 py-3">In</th><th class="px-4 py-3">Type</th><th class="px-4 py-3">Details</th></tr></thead><tbody class="divide-y divide-slate-200 dark:divide-slate-800">
+      ${ps.map(p0 => {
+        const p = deref(p0), x = deref(p?.schema) || {};
+        return `<tr><td class="px-4 py-3 font-mono">${esc(p?.name)} ${p?.required ? '<span class="text-red-400">*</span>' : ""}</td><td class="px-4 py-3"><span class="rounded bg-slate-100 px-2 py-1 text-xs text-slate-500 dark:bg-slate-800">${esc(p?.in)}</span></td><td class="px-4 py-3 font-mono text-xs text-cyan-600 dark:text-cyan-300">${esc(typeOf(p?.schema || x))}</td><td class="px-4 py-3 text-xs text-slate-500">${esc(p?.description || "")}${x.enum ? `<div class="mt-1 flex flex-wrap gap-1">${x.enum.map(v => `<span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : ""}</td></tr>`;
+      }).join("")}
+      </tbody></table></div></div></section>`;
+  }
+
+  function params(ps, endpointId) {
+    const headers = (ps ?? []).filter(raw => deref(raw)?.in === "header");
+    const regular = (ps ?? []).filter(raw => !["header", "body"].includes(deref(raw)?.in));
+    return [
+      parameterSection("Parameters", regular, endpointId + ":parameters-shape"),
+      parameterSection("Headers", headers, endpointId + ":headers-shape")
+    ].join("");
+  }
+
+  function responses(op, endpointId) {
+    return Object.entries(op.responses ?? {}).map(([code, r0]) => {
+      const r = deref(r0);
+      const first = Object.entries(r?.content ?? {})[0];
+      const media = first?.[1];
+      const schema = media?.schema ?? r?.schema;
+      const example = mediaExample(media) ?? Object.values(r?.examples ?? {})[0];
+      const responseHeaders = Object.entries(r?.headers ?? {}).map(([name, raw]) => ({
+        ...deref(raw),
+        name,
+        in: "header"
+      }));
+      const good = String(code).startsWith("2");
+      return `<div class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
+        <div class="flex items-center gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+          <span class="rounded-md px-2 py-1 font-mono text-xs font-semibold ${good ? "bg-emerald-500/15 text-emerald-500" : "bg-amber-500/15 text-amber-500"}">${esc(code)}</span>
+          <span class="text-sm text-slate-500">${esc(r?.description ?? "")}</span>
+          <span class="ml-auto text-[11px] text-slate-400">${esc(first?.[0] ?? "")}</span>
+        </div>
+        <div class="space-y-3 p-3">
+          ${parameterSection("Response headers", responseHeaders, endpointId + ":response-headers:" + code)}
+          ${schema ? schemaCard("Response schema", schema, endpointId + ":response:" + code) : ""}
+          ${mockCard("Mock response · " + code, endpointId + ":response-mock:" + code, schema, example, "response")}
+        </div>
+      </div>`;
+    }).join("") || '<p class="text-sm text-slate-500">No responses documented.</p>';
+  }
+
+  function endpointRow(e, on) {
+    return `<div role="button" tabindex="0" data-id="${esc(e.id)}" onclick="toggleEndpoint(this.dataset.id, event)" onkeydown="onEndpointKey(event)" aria-pressed="${on ? "true" : "false"}" class="group mb-1 flex w-full cursor-pointer select-none items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-900 ${on ? "bg-white ring-1 ring-blue-500/30 dark:bg-slate-900" : ""}">
+      <span class="flex h-4 w-4 shrink-0 items-center justify-center rounded border ${on ? "border-blue-500 bg-blue-500 text-white" : "border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-900"}">${on ? checkSvg : ""}</span>
+      ${badge(e.method)}
+      <span class="min-w-0 flex-1 truncate font-mono text-xs" title="${esc(e.path)}">${esc(e.path)}</span>
+      <button type="button" data-url="${esc(endpointUrl(e))}" onclick="event.stopPropagation(); copy(this.dataset.url)" aria-label="Copy URL" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Copy URL">${copySvg}</button>
+      <button type="button" data-id="${esc(e.id)}" onclick="event.stopPropagation(); solo(this.dataset.id)" class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Show only this endpoint">Only</button>
+    </div>`;
+  }
+
+  function sidebar() {
+    const selectedSet = new Set(S.selected);
+    const groups = groupedEndpoints();
+    return `<aside id="sidebar" style="width:${clampWidth(S.sidebarWidth)}px" class="flex min-h-0 shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950">
+      <div class="border-b border-slate-200 p-4 dark:border-slate-800">
+        <div class="flex items-center gap-3">
+          <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-500/15 text-blue-500">⌘</div>
+          <div class="min-w-0">
+            <h1 class="truncate text-sm font-semibold">${esc(S.spec.info?.title || "API Viewer")}</h1>
+            <p class="text-xs text-slate-500">${esc(S.spec.info?.version ? "v" + S.spec.info.version : "OpenAPI")}</p>
+          </div>
+          <button type="button" onclick="reset()" class="ml-auto rounded-md p-2 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800" title="Load another spec">↻</button>
+        </div>
+        <div class="relative mt-4">
+          <span class="absolute left-3 top-2.5 text-slate-400">⌕</span>
+          <input value="${esc(S.search)}" oninput="search(this.value)" placeholder="Search endpoints..." class="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm outline-none focus:border-slate-400 dark:border-slate-800 dark:bg-slate-900 dark:focus:border-slate-600">
+        </div>
+        <p class="mt-3 text-[11px] leading-4 text-slate-400">Click to toggle · Shift-click a range</p>
+        <div class="mt-2 flex items-center justify-between text-[11px]">
+          <span class="text-slate-500">${S.selected.length} selected</span>
+          <span class="flex gap-3">
+
+            <button type="button" onclick="clearSelection()" class="font-medium text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">Clear</button>
+          </span>
+        </div>
+      </div>
+      <div class="scroll min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
+        ${groups.length ? groups.map(([tag, es]) => `<div class="mb-4"><div class="px-3 pb-2 pt-2 text-[10px] font-bold uppercase tracking-widest text-slate-400">${esc(tag)}</div>${es.map(e => endpointRow(e, selectedSet.has(e.id))).join("")}</div>`).join("") : '<div class="p-4 text-center text-sm text-slate-500">No endpoints found.</div>'}
+      </div>
+    </aside>`;
+  }
+
+  function schemaName(reference) {
+    const encoded = reference?.split("/").pop() || "Schema";
+    try { return decodeURIComponent(encoded.replace(/~1/g, "/").replace(/~0/g, "~")); }
+    catch { return encoded; }
+  }
+
+  function enumValue(value) {
+    if (typeof value !== "string") return String(value);
+    return /^[\w.-]+$/.test(value) ? value : JSON.stringify(value);
+  }
+
+  function compactSchema(raw, context = "neutral", seen = new Set(), shared = null) {
+    if (!raw || typeof raw !== "object") return "any";
+    if (raw.$ref) {
+      const name = schemaName(raw.$ref);
+      if (shared && !shared.has(raw.$ref)) {
+        shared.set(raw.$ref, { name, definition: name });
+        const resolved = ref(raw.$ref);
+        if (resolved) shared.get(raw.$ref).definition = compactSchema(resolved, "neutral", new Set([...seen, raw.$ref]), shared);
+      }
+      return name;
+    }
+    if (raw.const !== undefined) return enumValue(raw.const);
+    if (raw.enum?.length) return raw.enum.map(enumValue).join("|");
+    if (raw.oneOf?.length) return raw.oneOf.map(schema => compactSchema(schema, context, new Set(seen), shared)).join("|");
+    if (raw.anyOf?.length) return raw.anyOf.map(schema => compactSchema(schema, context, new Set(seen), shared)).join("|");
+    if (raw.allOf?.length) return raw.allOf.map(schema => compactSchema(schema, context, new Set(seen), shared)).join("&");
+
+    const nullable = raw.nullable ? "|null" : "";
+    if (raw.type === "array" || raw.items) {
+      const item = compactSchema(raw.items ?? {}, context, new Set(seen), shared);
+      return (item.includes("|") || item.includes("&") ? `(${item})` : item) + "[]" + nullable;
+    }
+    if (raw.properties || raw.type === "object" || raw.additionalProperties) {
+      const required = new Set(raw.required ?? []);
+      const fields = Object.entries(raw.properties ?? {})
+        .filter(([, schema]) => !(context === "request" && schema?.readOnly) && !(context === "response" && schema?.writeOnly))
+        .map(([name, schema]) => `${name}${required.has(name) ? "*" : "?"}:${compactSchema(schema, context, new Set(seen), shared)}`);
+      if (raw.additionalProperties) {
+        fields.push(`[key]:${raw.additionalProperties === true ? "any" : compactSchema(raw.additionalProperties, context, new Set(seen), shared)}`);
+      }
+      return `{${fields.join(",")}}${nullable}`;
+    }
+    const aliases = { boolean: "bool", integer: "int" };
+    const type = Array.isArray(raw.type) ? raw.type.map(item => aliases[item] || item).join("|") : (aliases[raw.type] || raw.type || "any");
+    return `${type}${raw.format ? `(${raw.format})` : ""}${nullable}`;
+  }
+
+  function valueShape(value) {
+    if (value === undefined) return "any";
+    if (value === null) return "null";
+    if (Array.isArray(value)) return `${value.length ? valueShape(value[0]) : "any"}[]`;
+    if (typeof value === "object") return `{${Object.entries(value).map(([key, item]) => `${key}:${valueShape(item)}`).join(",")}}`;
+    if (typeof value === "boolean") return "bool";
+    if (typeof value === "number") return Number.isInteger(value) ? "int" : "number";
+    return typeof value;
+  }
+
+  function parameterMarker(parameter) {
+    const required = parameter?.required || parameter?.in === "path";
+    return `${parameter?.name || "unknown"}${required ? "*" : "?"}`;
+  }
+
+  function bodyTable(schema, required, shared, example) {
+    if (!schema) {
+      if (example && typeof example === "object" && !Array.isArray(example)) {
+        return Object.entries(example).map(([name, value]) => `${name},${valueShape(value)},no`).join("\n");
+      }
+      return `body,${valueShape(example)},${required ? "yes" : "no"}`;
+    }
+    const type = compactSchema(schema, "request", new Set(), shared);
+    if (schema.$ref || schema.allOf || schema.oneOf || schema.anyOf || schema.type === "array" || !schema.properties) {
+      return `body,${type},${required ? "yes" : "no"}`;
+    }
+    const requiredFields = new Set(schema.required ?? []);
+    return Object.entries(schema.properties)
+      .filter(([, field]) => !field?.readOnly)
+      .map(([name, field]) => `${name},${compactSchema(field, "request", new Set(), shared)},${requiredFields.has(name) ? "yes" : "no"}`)
+      .join("\n");
+  }
+
+  function isHttpValidationError(schema) {
+    if (!schema || typeof schema !== "object") return false;
+    if (schema.$ref && schemaName(schema.$ref) === "HTTPValidationError") return true;
+    if (schema.title === "HTTPValidationError") return true;
+    return schema.allOf?.length === 1 && !schema.properties && !schema.type && isHttpValidationError(schema.allOf[0]);
+  }
+
+  function promptForEndpoint(endpoint, shared) {
+    const op = endpoint.op;
+    const summary = String(op.summary || op.operationId || "").replace(/\s+/g, " ").trim();
+    const lines = [`## ${endpoint.method.toUpperCase()} ${endpoint.path}${summary ? `: ${summary}` : ""}`];
+    const labels = { header: "Headers", query: "Query", path: "Path", cookie: "Cookies", formData: "Form" };
+    const grouped = new Map();
+    for (const raw of endpoint.parameters ?? []) {
+      const parameter = deref(raw);
+      if (!parameter || parameter.in === "body") continue;
+      const label = labels[parameter.in] || parameter.in;
+      if (!grouped.has(label)) grouped.set(label, []);
+      grouped.get(label).push(parameterMarker(parameter));
+    }
+    for (const label of ["Headers", "Query", "Path", "Cookies", "Form"]) {
+      if (grouped.has(label)) lines.push(`${label}: ${grouped.get(label).join(", ")}`);
+    }
+
+    const requestBody = deref(op.requestBody) ?? op.requestBody;
+    const requestContent = Object.entries(requestBody?.content ?? {});
+    if (requestContent.length) {
+      for (const [mediaType, media] of requestContent) {
+        lines.push(`Body (${mediaType}):`, "field,type,req", bodyTable(media?.schema, requestBody?.required, shared, mediaExample(media)));
+      }
+    } else {
+      const bodyParameter = endpoint.parameters.map(deref).find(parameter => parameter?.in === "body");
+      if (bodyParameter) {
+        const mediaTypes = op.consumes?.length ? op.consumes.join(",") : S.spec?.consumes?.length ? S.spec.consumes.join(",") : "application/json";
+        lines.push(`Body (${mediaTypes}):`, "field,type,req", bodyTable(bodyParameter.schema, bodyParameter.required, shared));
+      }
+    }
+
+    for (const [code, rawResponse] of Object.entries(op.responses ?? {})) {
+      const response = deref(rawResponse) ?? {};
+      const rawContent = Object.values(response.content ?? {});
+      const content = rawContent.filter(media => !isHttpValidationError(media?.schema));
+      if (rawContent.length && !content.length) continue;
+      if (!rawContent.length && isHttpValidationError(response.schema)) continue;
+      if (content.length) {
+        const shapes = [...new Set(content.map(media => media?.schema ? compactSchema(media.schema, "response", new Set(), shared) : valueShape(mediaExample(media))))];
+        lines.push(`Returns ${code}: ${shapes.join("|")}`);
+      } else if (response.schema) {
+        lines.push(`Returns ${code}: ${compactSchema(response.schema, "response", new Set(), shared)}`);
+      } else {
+        lines.push(`Returns ${code}: ${String(response.description || "no body").replace(/\s+/g, " ").trim()}`);
+      }
+      const responseHeaders = Object.entries(response.headers ?? {}).map(([name, header]) => parameterMarker({ ...deref(header), name, in: "header" }));
+      if (responseHeaders.length) lines.push(`Response headers ${code}: ${responseHeaders.join(", ")}`);
+    }
+    return lines.join("\n");
+  }
+
+  function selectedEndpointsPrompt() {
+    const selected = S.endpoints.filter(endpoint => S.selected.includes(endpoint.id));
+    const shared = new Map();
+    const endpoints = selected.map(endpoint => promptForEndpoint(endpoint, shared));
+    const intro = "API contract. Ask if anything is unclear.\nConventions: * = required, ? = optional (nullable).";
+    const sharedBlock = shared.size ? `## Shared\n${[...shared.values()].map(schema => `${schema.name}: ${schema.definition}`).join("\n")}` : "";
+    return [intro, sharedBlock, ...endpoints].filter(Boolean).join("\n\n");
+  }
+
+  function jumpNav(list) {
+    return `<div class="sticky top-0 z-10 -mx-8 mb-8 border-b border-slate-200 bg-white/90 px-8 py-3 backdrop-blur dark:border-slate-800 dark:bg-slate-950/90">
+      <div class="flex items-center gap-3">
+        <span class="mr-auto text-xs text-slate-500">${list.length} endpoint${list.length === 1 ? "" : "s"} selected</span>
+        <button type="button" onclick="copyPrompt()" class="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Copy prompt</button>
+        <button type="button" onclick="clearSelection()" title="Remove all selected endpoints" aria-label="Remove all selected endpoints" class="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-base text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-200">&times;</button>
+      </div>
+      ${list.length ? `<div class="mt-3 flex flex-wrap gap-2">${list.map(e => `<div class="relative"><button type="button" onclick="jumpTo('${panelId(e.id)}')" class="flex max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white py-1 pl-2 pr-7 hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900">${badge(e.method)}<span class="max-w-[200px] truncate font-mono text-[11px]">${esc(e.path)}</span></button><button type="button" data-id="${esc(e.id)}" onclick="event.stopPropagation(); toggleEndpoint(this.dataset.id, event)" title="Remove ${esc(e.path)} from selection" aria-label="Remove ${esc(e.path)} from selection" class="absolute right-1 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-xs text-slate-400 hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200">&times;</button></div>`).join("")}</div>` : ""}
+    </div>`;
+  }
+
+  function endpointPanel(e, index, total) {
+    const requestMedia = Object.values(e.op.requestBody?.content ?? {})[0];
+    const swaggerBody = e.parameters.map(deref).find(parameter => parameter?.in === "body");
+    const body = requestMedia?.schema ?? swaggerBody?.schema;
+    const bodyExample = mediaExample(requestMedia) ?? swaggerBody?.['x-example'];
+    const url = endpointUrl(e);
+    const responseShapeKey = e.id + ":responses-shape";
+    S.simpleJson.set(responseShapeKey, Object.fromEntries(Object.entries(e.op.responses ?? {}).map(([code, raw]) => {
+      const response = deref(raw);
+      const media = Object.values(response?.content ?? {})[0];
+      return [code, window.ApiMock.shape(media?.schema ?? response?.schema ?? {}, S.spec)];
+    })));
+    return `<article id="${panelId(e.id)}" class="scroll-mt-24 ${index < total - 1 ? "mb-10 border-b border-slate-200 pb-10 dark:border-slate-800" : ""}">
+      <div class="mb-8">
+        <div class="flex items-center gap-3">
+          ${badge(e.method)}
+          <code class="min-w-0 truncate text-lg">${esc(e.path)}</code>
+          <div class="ml-auto flex shrink-0 items-center gap-2">
+            <button type="button" data-url="${esc(url)}" onclick="copy(this.dataset.url)" class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800">Copy URL</button>
+            <button type="button" data-id="${esc(e.id)}" onclick="toggleEndpoint(this.dataset.id)" title="Remove from selection" class="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-200">✕</button>
+          </div>
+        </div>
+        <h2 class="mt-4 text-2xl font-semibold">${esc(e.op.summary || e.op.operationId || e.path)}</h2>
+        ${e.op.description ? `<p class="mt-2 max-w-3xl whitespace-pre-wrap text-sm leading-6 text-slate-500">${esc(e.op.description)}</p>` : ""}
+        <div class="mt-4 flex items-center gap-2 text-xs text-slate-400"><span>Endpoint</span><code class="rounded bg-slate-100 px-2 py-1 dark:bg-slate-900">${esc(url)}</code></div>
+      </div>
+      <div class="space-y-7">
+        ${params(e.parameters, e.id)}
+        ${body ? schemaCard("Request schema", body, e.id + ":request") : ""}
+        ${mockCard("Mock request payload", e.id + ":request-mock", body, bodyExample, "request")}
+        <section><div class="mb-3 flex items-center"><h3 class="text-sm font-semibold">Responses</h3>${copyJsonButton(responseShapeKey, "Copy keys & types")}</div><div class="space-y-3">${responses(e.op, e.id)}</div></section>
+        <details class="rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900/60">
+          <summary class="cursor-pointer px-4 py-3 text-sm text-slate-500">Raw endpoint JSON</summary>
+          <pre class="scroll overflow-auto border-t border-slate-200 p-4 text-xs text-slate-500 dark:border-slate-800">${esc(JSON.stringify(e.op, null, 2))}</pre>
+        </details>
+      </div>
+    </article>`;
+  }
+
+  function main() {
+    const selected = S.endpoints.filter(e => S.selected.includes(e.id));
+    if (!selected.length) {
+      return `<main class="flex min-h-0 min-w-0 flex-1 items-center justify-center px-6 text-center text-sm text-slate-500">Select one or more endpoints from the sidebar.</main>`;
+    }
+    return `<main class="scroll min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain">
+      <div class="mx-auto max-w-5xl px-8 py-10">
+        ${jumpNav(selected)}
+        ${selected.map((e, i) => endpointPanel(e, i, selected.length)).join("")}
+      </div>
+    </main>`;
+  }
+
+  function landingCard() {
+    return `<div class="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-10 text-center dark:border-slate-700 dark:bg-slate-900/60">
+      <form id="remote-form" class="text-left" method="post" action="#" autocomplete="on" onsubmit="return submitRemoteForm(event)">
+        <p class="mb-3 text-xs font-medium uppercase tracking-wide text-slate-400">Fetch from URL</p>
+       
+        <label class="mb-1 block text-xs text-slate-500" for="spec-url">OpenAPI URL</label>
+        <input id="spec-url" name="spec-url" type="url" required spellcheck="false" autocomplete="url" value="${esc(S.remote.url)}" oninput="updateRemoteField('url', this.value)" placeholder="https://swagger/openapi.json" class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 dark:border-slate-800 dark:bg-slate-950">
+        <div class="mt-2 grid grid-cols-2 gap-2">
+          <div>
+            <label class="mb-1 block text-xs text-slate-500" for="spec-username">Username</label>
+            <input id="spec-username" name="username" type="text" spellcheck="false" autocomplete="username" value="${esc(S.remote.username)}" oninput="updateRemoteField('username', this.value)" placeholder="Username" class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 dark:border-slate-800 dark:bg-slate-950">
+          </div>
+          <div>
+            <label class="mb-1 block text-xs text-slate-500" for="spec-password">Password</label>
+            <input id="spec-password" name="password" type="password" autocomplete="current-password" value="${esc(S.remote.password)}" oninput="updateRemoteField('password', this.value)" placeholder="Password" class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 dark:border-slate-800 dark:bg-slate-950">
+          </div>
+        </div>
+        <button type="submit" ${S.fetching ? "disabled" : ""} class="mt-3 w-full rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60">${S.fetching ? "Fetching…" : "Fetch spec"}</button>
+        ${S.fetchError ? `<p class="mt-2 text-xs text-red-400" role="alert">${esc(S.fetchError)}</p>` : ""}
+      </form>
+
+      <div class="my-6 flex items-center gap-3 text-[11px] uppercase tracking-widest text-slate-400"><span class="h-px flex-1 bg-slate-200 dark:bg-slate-800"></span>or<span class="h-px flex-1 bg-slate-200 dark:bg-slate-800"></span></div>
+
+      <input id="file" type="file" accept=".json,application/json" class="hidden" onchange="file(this)">
+      <button type="button" onclick="document.getElementById('file').click()" class="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-500">Upload JSON</button>
+      <p class="mt-3 text-xs text-slate-500">or paste your Swagger/OpenAPI JSON below</p>
+      <textarea id="paste" class="mt-5 h-44 w-full rounded-xl border border-slate-200 bg-white p-4 font-mono text-xs outline-none focus:border-blue-500 dark:border-slate-800 dark:bg-slate-950" placeholder='{"openapi":"3.0.0","paths":{...}}'></textarea>
+      <button type="button" onclick="paste()" class="mt-3 w-full rounded-lg border border-slate-200 py-2.5 text-sm font-medium hover:bg-slate-100 dark:border-slate-800 dark:hover:bg-slate-800">Open JSON</button>
+
+      <div class="mt-6 flex justify-center">
+        <button type="button" onclick="toggleTheme()" class="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-500 hover:bg-slate-100 dark:border-slate-800 dark:hover:bg-slate-800">${S.theme === "dark" ? "☀ Light theme" : "☾ Dark theme"}</button>
+      </div>
+    </div>`;
+  }
+
+  function render() {
+    const sideScroll = document.querySelector("#sidebar .scroll")?.scrollTop ?? 0;
+    const mainScroll = document.querySelector("main.scroll")?.scrollTop ?? 0;
+
+    document.documentElement.classList.toggle("dark", S.theme === "dark");
+    document.documentElement.classList.toggle("light", S.theme !== "dark");
+    document.body.classList.add("h-full");
+    document.body.classList.toggle("bg-slate-950", S.theme === "dark");
+    document.body.classList.toggle("text-slate-100", S.theme === "dark");
+    document.body.classList.toggle("bg-white", S.theme !== "dark");
+    document.body.classList.toggle("text-slate-900", S.theme !== "dark");
+
+    const root = document.getElementById("app");
+    S.mockDefinitions = new Map();
+    S.simpleJson = new Map();
+    if (!S.spec) {
+      root.innerHTML = `<div class="flex min-h-full items-center justify-center p-6"><div class="w-full max-w-2xl">
+        <div class="mb-8 text-center">
+          <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-500/15 text-2xl text-blue-500">⌘</div>
+          <h1 class="text-3xl font-semibold">API Viewer</h1>
+          <p class="mt-2 text-sm text-slate-500">A lightweight Swagger/OpenAPI viewer. Everything stays in your browser.</p>
+        </div>
+        ${landingCard()}
+      </div></div>`;
+      return;
+    }
+
+    root.innerHTML = `<div class="flex h-full min-h-0">${sidebar()}<div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize" onpointerdown="startResize(event)" class="relative z-20 w-0 shrink-0"><span class="absolute inset-y-0 -left-1.5 w-3 cursor-col-resize"></span><span class="resizer-line"></span><span class="resizer-grip"></span></div>${main()}<button type="button" onclick="toggleTheme()" class="fixed bottom-5 right-5 flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white p-0 text-lg leading-none shadow-lg hover:scale-105 dark:border-slate-700 dark:bg-slate-900" title="Toggle theme">${S.theme === "dark" ? "☀" : "☾"}</button></div>`;
+
+    const side = document.querySelector("#sidebar .scroll");
+    if (side) side.scrollTop = sideScroll;
+    const mainEl = document.querySelector("main.scroll");
+    if (mainEl) mainEl.scrollTop = mainScroll;
+  }
+
+  window.updateRemoteField = (field, value) => {
+    S.remote[field] = value;
+    if (field === "url") localStorage.setItem("openapi-url", value);
+  };
+
+  window.submitRemoteForm = event => {
+    event.preventDefault();
+    fetchSpec();
+    return false;
+  };
+
+  window.fetchSpec = async () => {
+    if (S.fetching) return;
+    syncRemoteFromForm();
+    const { url, username, password } = S.remote;
+    if (!url) {
+      S.fetchError = "Enter a spec URL.";
+      render();
+      return;
+    }
+    S.fetching = true;
+    S.fetchError = "";
+    render();
+    try {
+      const json = await fetchWithAuth(url, username, password);
+      S.fetching = false;
+      load(JSON.parse(json));
+    } catch (error) {
+      S.fetching = false;
+      S.fetchError = friendlyFetchError(error);
+      render();
+    }
+  };
+
+  window.toggleSchema = button => {
+    const el = document.getElementById(button.dataset.target);
+    const key = button.dataset.key;
+    if (!el || !key) return;
+    const open = !S.openSchemas.has(key);
+    if (open) S.openSchemas.add(key);
+    else S.openSchemas.delete(key);
+    el.classList.toggle("is-open", open);
+    button.classList.toggle("is-open", open);
+    button.setAttribute("aria-expanded", open ? "true" : "false");
+    button.title = open ? "Collapse object" : "Expand object";
+  };
+
+  window.toggleEndpoint = (id, event) => {
+    if (event?.shiftKey) event.preventDefault();
+    const wasSelected = S.selected.includes(id);
+    const selected = new Set(S.selected);
+    const visible = visualEndpoints().map(endpoint => endpoint.id);
+    let ranged = false;
+    if (event?.shiftKey && S.focusId) {
+      const a = visible.indexOf(S.focusId);
+      const b = visible.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        const [start, end] = a < b ? [a, b] : [b, a];
+        visible.slice(start, end + 1).forEach(item => selected.add(item));
+        ranged = true;
+      }
+    }
+    if (!ranged) {
+      if (selected.has(id)) selected.delete(id);
+      else selected.add(id);
+      S.focusId = id;
+    }
+    S.selected = S.endpoints.map(endpoint => endpoint.id).filter(item => selected.has(item));
+    render();
+    if (!wasSelected && !ranged) {
+      document.getElementById(panelId(id))?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
+
+  window.onEndpointKey = event => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    toggleEndpoint(event.currentTarget.dataset.id, event);
+  };
+
+  window.solo = id => {
+    S.focusId = id;
+    S.selected = [id];
+    render();
+    const mainEl = document.querySelector("main.scroll");
+    if (mainEl) mainEl.scrollTop = 0;
+  };
+
+  window.selectVisible = () => {
+    const selected = new Set(S.selected);
+    visualEndpoints().forEach(e => selected.add(e.id));
+    S.selected = S.endpoints.map(e => e.id).filter(id => selected.has(id));
+    render();
+  };
+
+  window.clearSelection = () => {
+    S.selected = [];
+    S.focusId = null;
+    render();
+  };
+
+  window.jumpTo = id => {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  window.startResize = event => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const aside = document.getElementById("sidebar");
+    const startX = event.clientX;
+    const startW = aside?.getBoundingClientRect().width ?? S.sidebarWidth;
+    document.body.classList.add("is-resizing");
+    const move = ev => {
+      S.sidebarWidth = clampWidth(startW + ev.clientX - startX);
+      syncSidebarWidth();
+    };
+    const up = () => {
+      document.body.classList.remove("is-resizing");
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      document.removeEventListener("pointercancel", up);
+      localStorage.setItem("api-viewer-sidebar", String(S.sidebarWidth));
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+    document.addEventListener("pointercancel", up);
+  };
+
+  window.file = input => {
+    const f = input.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { try { load(JSON.parse(r.result)); } catch (e) { alert(e.message); } };
+    r.readAsText(f);
+  };
+
+  window.paste = () => {
+    try { load(JSON.parse(document.getElementById("paste").value)); } catch (e) { alert(e.message); }
+  };
+
+  window.search = q => {
+    S.search = q;
+    render();
+    const input = document.querySelector("input[placeholder='Search endpoints...']");
+    if (input) {
+      input.focus();
+      input.setSelectionRange(q.length, q.length);
+    }
+  };
+
+  window.reset = () => {
+    S.spec = null;
+    S.endpoints = [];
+    S.selected = [];
+    S.focusId = null;
+    S.openSchemas = new Set();
+    S.mockData = new Map();
+    S.mockDefinitions = new Map();
+    S.simpleJson = new Map();
+    S.search = "";
+    S.fetchError = "";
+    S.fetching = false;
+    render();
+  };
+
+  window.toggleTheme = () => {
+    S.theme = S.theme === "dark" ? "light" : "dark";
+    localStorage.setItem("api-viewer-theme", S.theme);
+    render();
+  };
+
+  async function writeClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    if (!copied) throw new Error("Copy command failed");
+  }
+
+  window.copy = async text => {
+    try {
+      await writeClipboard(text);
+      showToast("URL copied to clipboard");
+    } catch {
+      showToast("Could not copy URL", true);
+    }
+  };
+
+  window.copyPrompt = async () => {
+    if (!S.selected.length) return showToast("Select at least one endpoint", true);
+    try {
+      await writeClipboard(selectedEndpointsPrompt());
+      showToast(`Prompt copied for ${S.selected.length} endpoint${S.selected.length === 1 ? "" : "s"}`);
+    } catch {
+      showToast("Could not copy prompt", true);
+    }
+  };
+
+  window.copyMock = async key => {
+    if (!S.mockData.has(key)) return showToast("Mock data is unavailable", true);
+    try {
+      await writeClipboard(JSON.stringify(S.mockData.get(key), null, 2));
+      showToast("Mock JSON copied to clipboard");
+    } catch {
+      showToast("Could not copy mock JSON", true);
+    }
+  };
+
+  function generateMock(key) {
+    const definition = S.mockDefinitions.get(key);
+    if (!definition) return null;
+    const hasSchema = definition.schema && Object.keys(definition.schema).length > 0;
+    return window.ApiMock.generate(definition.schema, S.spec, {
+      example: hasSchema ? undefined : definition.example,
+      forRequest: definition.mode === "request",
+      forResponse: definition.mode === "response"
+    });
+  }
+
+  window.regenerateMock = key => {
+    if (!S.mockDefinitions.has(key)) return showToast("Mock definition is unavailable", true);
+    S.mockData.set(key, generateMock(key));
+    render();
+    showToast("New random mock generated");
+  };
+
+  window.copySimpleJson = async key => {
+    if (!S.simpleJson.has(key)) return showToast("Schema is unavailable", true);
+    try {
+      await writeClipboard(JSON.stringify(S.simpleJson.get(key), null, 2));
+      showToast("Keys and types copied");
+    } catch {
+      showToast("Could not copy schema", true);
+    }
+  };
+
+  window.showToast = (message, error = false) => {
+    const old = document.getElementById("api-toast");
+    if (old) old.remove();
+    const toast = document.createElement("div");
+    toast.id = "api-toast";
+    toast.className = `fixed bottom-5 left-1/2 z-50 -translate-x-1/2 flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium shadow-2xl backdrop-blur transition-all ${
+      error
+        ? "border-red-500/30 bg-red-500/10 text-red-400"
+        : "border-emerald-500/30 bg-white/95 text-slate-700 dark:bg-slate-900/95 dark:text-slate-200"
+    }`;
+    toast.innerHTML = `<span class="flex h-5 w-5 items-center justify-center rounded-full ${
+      error ? "bg-red-500/15 text-red-400" : "bg-emerald-500/15 text-emerald-500"
+    }">${error ? "!" : "✓"}</span><span>${esc(message)}</span>`;
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add("opacity-100"));
+    setTimeout(() => {
+      toast.style.opacity = "0";
+      toast.style.transform = "translate(-50%, 8px)";
+      setTimeout(() => toast.remove(), 180);
+    }, 2200);
+  };
+
+  window.addEventListener("resize", syncSidebarWidth);
+  render();
+})();
+</script>
+</body>
+</html>
