@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Swagger">
+  <rect width="32" height="32" rx="7" fill="#85EA2D"/>
+  <g fill="none" stroke="#173647" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M13.5 9.5c-2.8 0-4 1.8-4 5s1.2 5 4 5"/>
+    <path d="M11.5 9.5v2M11.5 17.5v2"/>
+    <path d="M18.5 9.5c2.8 0 4 1.8 4 5s-1.2 5-4 5"/>
+    <path d="M20.5 9.5v2M20.5 17.5v2"/>
+  </g>
+</svg>
