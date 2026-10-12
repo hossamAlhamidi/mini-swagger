@@ -35,7 +35,9 @@
     mockData: new Map(),
     mockDefinitions: new Map(),
     simpleJson: new Map(),
-    schemaSearch: new Map()
+    schemaSearch: new Map(),
+    specDocumentUrl: "",
+    specOrigin: ""
   };
 
   const checkSvg = '<svg class="h-3 w-3" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 10.5 8.2 14 15 6.5"/></svg>';
@@ -165,13 +167,142 @@
     }
     return null;
   }
-  function baseUrl() {
-    if (S.spec?.servers?.[0]?.url) return S.spec.servers[0].url.replace(/\/$/, "");
-    if (S.spec?.host) return `${S.spec.schemes?.[0] || "https"}://${S.spec.host}${S.spec.basePath || ""}`.replace(/\/$/, "");
-    return "";
+  function resolveServerTemplate(url, variables = {}) {
+    return String(url ?? "").replace(/\{([^}]+)\}/g, (_, key) => {
+      const entry = variables[key];
+      const value = entry?.default ?? entry?.enum?.[0];
+      return value ?? key;
+    });
+  }
+  function serverEntriesForEndpoint(e) {
+    const pathItem = S.spec?.paths?.[e.path];
+    const list = e.op?.servers ?? pathItem?.servers ?? S.spec?.servers;
+    if (list?.length) return list;
+    if (S.spec?.host) {
+      const scheme = S.spec.schemes?.[0] ?? "https";
+      const basePath = (S.spec.basePath ?? "").replace(/\/$/, "");
+      return [{ url: `${scheme}://${S.spec.host}${basePath}` }];
+    }
+    return [{ url: "" }];
+  }
+  function resolveServerBase(serverEntry) {
+    let url = resolveServerTemplate(serverEntry?.url ?? "", serverEntry?.variables ?? {}).trim();
+    if (url.endsWith("/") && url !== "/") url = url.slice(0, -1);
+    if (/^https?:\/\//i.test(url)) return url;
+    const documentBase = S.specDocumentUrl || (S.specOrigin ? `${S.specOrigin}/` : "");
+    if (url) {
+      try {
+        return new URL(url, documentBase || "http://localhost/").href.replace(/\/$/, "");
+      } catch {
+        return url.startsWith("/") ? `http://localhost${url}` : `http://localhost/${url}`;
+      }
+    }
+    if (S.specOrigin) return S.specOrigin;
+    if (documentBase) {
+      try { return new URL(documentBase).origin; } catch { /* fall through */ }
+    }
+    return "http://localhost";
+  }
+  function joinServerAndPath(serverBase, path) {
+    const base = serverBase.replace(/\/$/, "");
+    const segment = path.startsWith("/") ? path : `/${path}`;
+    return `${base}${segment}`;
+  }
+  function normalizeRequestUrl(url) {
+    try {
+      return new URL(url).href;
+    } catch {
+      if (String(url).startsWith("/")) return `http://localhost${url}`;
+      return `http://${url}`;
+    }
+  }
+  function filledPathForEndpoint(e) {
+    let path = e.path;
+    for (const raw of e.parameters ?? []) {
+      const p = deref(raw);
+      if (p?.in !== "path" || !p.name) continue;
+      const token = `{${p.name}}`;
+      if (!path.includes(token)) continue;
+      path = path.split(token).join(encodeURIComponent(String(parameterExample(raw))));
+    }
+    return path;
+  }
+  function requestUrlForEndpoint(e, { includeQuery = true } = {}) {
+    const serverBase = resolveServerBase(serverEntriesForEndpoint(e)[0]);
+    let url = joinServerAndPath(serverBase, filledPathForEndpoint(e));
+    if (includeQuery) {
+      const query = new URLSearchParams();
+      for (const raw of e.parameters ?? []) {
+        const p = deref(raw);
+        if (p?.in === "query" && p.name) query.set(p.name, String(parameterExample(raw)));
+      }
+      const qs = query.toString();
+      if (qs) url += (url.includes("?") ? "&" : "?") + qs;
+    }
+    return normalizeRequestUrl(url);
   }
   function endpointUrl(e) {
-    return `${baseUrl()}${e.path}` || e.path;
+    return requestUrlForEndpoint(e, { includeQuery: false });
+  }
+  function shellSingleQuote(text) {
+    return `'${String(text).replace(/'/g, `'\\''`)}'`;
+  }
+  function curlArg(value) {
+    const text = String(value);
+    if (/^[A-Za-z0-9/:?&=#@._%+,~-]+$/.test(text)) return text;
+    return shellSingleQuote(text);
+  }
+  function parameterExample(raw) {
+    const p = deref(raw);
+    if (!p) return "value";
+    if (p.example !== undefined) return p.example;
+    const namedExample = p.examples && typeof p.examples === "object" ? Object.values(p.examples)[0]?.value : undefined;
+    if (namedExample !== undefined) return namedExample;
+    const schema = deref(p.schema);
+    if (schema?.example !== undefined) return schema.example;
+    const generated = window.ApiMock.generate(schema || { type: "string" }, S.spec, { forRequest: true });
+    return generated ?? "value";
+  }
+  function curlForEndpoint(e) {
+    const method = e.method.toUpperCase();
+    const url = requestUrlForEndpoint(e);
+
+    const headerLines = [];
+    const hasContentType = () => headerLines.some(line => line.toLowerCase().startsWith("content-type:"));
+    for (const raw of e.parameters ?? []) {
+      const p = deref(raw);
+      if (p?.in !== "header" || !p.name) continue;
+      headerLines.push(`${p.name}: ${parameterExample(raw)}`);
+    }
+
+    let bodyJson = null;
+    const requestBody = deref(e.op.requestBody) ?? e.op.requestBody;
+    const requestContent = Object.entries(requestBody?.content ?? {});
+    if (requestContent.length) {
+      const [mediaType, media] = requestContent[0];
+      if (!hasContentType()) headerLines.push(`Content-Type: ${mediaType}`);
+      const payload = window.ApiMock.generate(media?.schema ?? {}, S.spec, {
+        forRequest: true,
+        example: mediaExample(media)
+      });
+      if (payload !== null && payload !== undefined) bodyJson = JSON.stringify(payload);
+    } else {
+      const bodyParameter = (e.parameters ?? []).map(deref).find(parameter => parameter?.in === "body");
+      if (bodyParameter?.schema) {
+        const mediaType = e.op.consumes?.[0] ?? S.spec?.consumes?.[0] ?? "application/json";
+        if (!hasContentType()) headerLines.push(`Content-Type: ${mediaType}`);
+        const payload = window.ApiMock.generate(bodyParameter.schema, S.spec, {
+          forRequest: true,
+          example: bodyParameter["x-example"] ?? bodyParameter.example
+        });
+        if (payload !== null && payload !== undefined) bodyJson = JSON.stringify(payload);
+      }
+    }
+
+    const parts = [`curl -X ${method}`, curlArg(url)];
+    for (const header of headerLines) parts.push("-H", curlArg(header));
+    if (bodyJson !== null && !["GET", "HEAD"].includes(method)) parts.push("-d", curlArg(bodyJson));
+    return parts.join(" ");
   }
   function queryText(e) {
     return `${e.path} ${e.method} ${e.op.summary ?? ""} ${e.op.description ?? ""} ${(e.op.tags ?? []).join(" ")}`.toLowerCase();
@@ -231,10 +362,17 @@
     S.remote.password = String(data.get("password") ?? "");
   }
 
-  function load(obj) {
+  function load(obj, { specDocumentUrl } = {}) {
     if (!obj || typeof obj !== "object") throw Error("Invalid JSON");
     if (!obj.openapi && !obj.swagger) throw Error("This doesn't look like Swagger/OpenAPI JSON.");
     S.spec = obj;
+    if (specDocumentUrl !== undefined) {
+      S.specDocumentUrl = specDocumentUrl;
+      try { S.specOrigin = new URL(specDocumentUrl).origin; } catch { S.specOrigin = ""; }
+    } else {
+      S.specDocumentUrl = "";
+      S.specOrigin = "";
+    }
     S.endpoints = [];
     S.openSchemas = new Set();
     S.schemaSearch = new Map();
@@ -420,6 +558,7 @@
       <span class="min-w-0 flex-1 truncate font-mono text-xs" title="${esc(e.path)}">${esc(e.path)}</span>
       ${opDeprecated ? deprecatedBadge() : ""}
       <button type="button" data-url="${esc(endpointUrl(e))}" onclick="event.stopPropagation(); copy(this.dataset.url)" aria-label="Copy URL" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Copy URL">${copySvg}</button>
+      <button type="button" data-id="${esc(e.id)}" onclick="event.stopPropagation(); copyCurl(this.dataset.id)" aria-label="Copy curl" class="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] font-medium text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Copy curl">curl</button>
       <button type="button" data-id="${esc(e.id)}" onclick="event.stopPropagation(); solo(this.dataset.id)" class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Show only this endpoint">Only</button>
     </div>`;
   }
@@ -649,6 +788,7 @@
           <code class="min-w-0 truncate text-lg">${esc(e.path)}</code>
           <div class="ml-auto flex shrink-0 items-center gap-2">
             <button type="button" data-url="${esc(url)}" onclick="copy(this.dataset.url)" class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800">Copy URL</button>
+            <button type="button" data-id="${esc(e.id)}" onclick="copyCurl(this.dataset.id)" class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800">Copy curl</button>
             <button type="button" data-id="${esc(e.id)}" onclick="toggleEndpoint(this.dataset.id)" title="Remove from selection" class="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-200">✕</button>
           </div>
         </div>
@@ -779,7 +919,7 @@
     try {
       const json = await fetchWithAuth(url, username, password);
       S.fetching = false;
-      load(JSON.parse(json));
+      load(JSON.parse(json), { specDocumentUrl: url });
     } catch (error) {
       S.fetching = false;
       S.fetchError = friendlyFetchError(error);
@@ -1075,6 +1215,17 @@
       showToast("URL copied to clipboard");
     } catch {
       showToast("Could not copy URL", true);
+    }
+  };
+
+  window.copyCurl = async id => {
+    const endpoint = S.endpoints.find(item => item.id === id);
+    if (!endpoint) return showToast("Endpoint not found", true);
+    try {
+      await writeClipboard(curlForEndpoint(endpoint));
+      showToast("curl copied to clipboard");
+    } catch {
+      showToast("Could not copy curl", true);
     }
   };
 
