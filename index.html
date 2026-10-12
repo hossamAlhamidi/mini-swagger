@@ -53,6 +53,10 @@
     head: "bg-slate-500/15 text-slate-400 border-slate-500/20"
   };
   const badge = m => `<span class="inline-flex min-w-[54px] justify-center rounded-md border px-2 py-1 text-[10px] font-bold tracking-wide ${methods[m] || methods.get}">${m.toUpperCase()}</span>`;
+  const deprecatedBadge = () => '<span class="text-[10px] font-semibold text-amber-500">deprecated</span>';
+  function isDeprecated(raw, resolved) {
+    return !!(raw?.deprecated || resolved?.deprecated);
+  }
 
   function clampWidth(n) {
     const value = Number.isFinite(n) ? n : 330;
@@ -79,7 +83,9 @@
     if (x.$ref) {
       if (seen.has(x.$ref)) return { type: "object", description: "Circular reference" };
       const t = ref(x.$ref);
-      return t ? deref(t, new Set([...seen, x.$ref])) : x;
+      if (!t) return x;
+      const resolved = deref(t, new Set([...seen, x.$ref]));
+      return x.deprecated ? { ...resolved, deprecated: true } : resolved;
     }
     return x;
   }
@@ -269,14 +275,16 @@
       const key = path + "/" + name;
       const open = S.openSchemas.has(key);
       const domId = schemaDomId(key);
+      const deprecated = isDeprecated(raw, x);
 
       return `<div data-schema-row data-key-name="${esc(name)}" class="schema-row border-b border-slate-200 last:border-0 dark:border-slate-800/70">
         <div class="schema-row-main flex gap-2 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/30" style="padding-left:${16 + level * 18}px">
           ${nested ? `<button type="button" data-key="${esc(key)}" data-target="${domId}" onclick="toggleSchema(this)" aria-expanded="${open ? "true" : "false"}" title="${open ? "Collapse object" : "Expand object"}" class="schema-toggle mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-400 shadow-sm hover:border-blue-400 hover:text-blue-500 dark:border-slate-700 dark:bg-slate-800${open ? " is-open" : ""}">${chevronSvg}</button>` : `<span class="w-5 shrink-0"></span>`}
           <div class="min-w-0 flex-1">
             <div class="flex flex-wrap items-center gap-2">
-              <code class="schema-key text-sm">${esc(name)}</code>
+              <code class="schema-key text-sm${deprecated ? " text-slate-400 line-through decoration-slate-500/70" : ""}">${esc(name)}</code>
               ${req.has(name) ? '<span class="text-[10px] font-semibold text-red-400">required</span>' : ""}
+              ${deprecated ? deprecatedBadge() : ""}
               ${x?.nullable ? '<span class="text-[10px] text-slate-500">nullable</span>' : ""}
               ${nested ? `<span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800">${fieldCount} fields</span>` : ""}
             </div>
@@ -357,7 +365,8 @@
       <tr><th class="px-4 py-3">Name</th><th class="px-4 py-3">In</th><th class="px-4 py-3">Type</th><th class="px-4 py-3">Details</th></tr></thead><tbody class="divide-y divide-slate-200 dark:divide-slate-800">
       ${ps.map(p0 => {
         const p = deref(p0), x = deref(p?.schema) || {};
-        return `<tr><td class="px-4 py-3 font-mono">${esc(p?.name)} ${p?.required ? '<span class="text-red-400">*</span>' : ""}</td><td class="px-4 py-3"><span class="rounded bg-slate-100 px-2 py-1 text-xs text-slate-500 dark:bg-slate-800">${esc(p?.in)}</span></td><td class="px-4 py-3 font-mono text-xs text-cyan-600 dark:text-cyan-300">${esc(typeOf(p?.schema || x))}</td><td class="px-4 py-3 text-xs text-slate-500">${esc(p?.description || "")}${x.enum ? `<div class="mt-1 flex flex-wrap gap-1">${x.enum.map(v => `<span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : ""}</td></tr>`;
+        const deprecated = isDeprecated(p0, p);
+        return `<tr class="${deprecated ? "opacity-80" : ""}"><td class="px-4 py-3 font-mono">${esc(p?.name)} ${p?.required ? '<span class="text-red-400">*</span>' : ""}${deprecated ? ` ${deprecatedBadge()}` : ""}</td><td class="px-4 py-3"><span class="rounded bg-slate-100 px-2 py-1 text-xs text-slate-500 dark:bg-slate-800">${esc(p?.in)}</span></td><td class="px-4 py-3 font-mono text-xs text-cyan-600 dark:text-cyan-300">${esc(typeOf(p?.schema || x))}</td><td class="px-4 py-3 text-xs text-slate-500">${esc(p?.description || "")}${x.enum ? `<div class="mt-1 flex flex-wrap gap-1">${x.enum.map(v => `<span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">${esc(JSON.stringify(v))}</span>`).join("")}</div>` : ""}</td></tr>`;
       }).join("")}
       </tbody></table></div></div></section>`;
   }
@@ -404,10 +413,12 @@
   }
 
   function endpointRow(e, on) {
-    return `<div role="button" tabindex="0" data-id="${esc(e.id)}" onclick="toggleEndpoint(this.dataset.id, event)" onkeydown="onEndpointKey(event)" aria-pressed="${on ? "true" : "false"}" class="group mb-1 flex w-full cursor-pointer select-none items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-900 ${on ? "bg-white ring-1 ring-blue-500/30 dark:bg-slate-900" : ""}">
+    const opDeprecated = !!e.op?.deprecated;
+    return `<div role="button" tabindex="0" data-id="${esc(e.id)}" onclick="toggleEndpoint(this.dataset.id, event)" onkeydown="onEndpointKey(event)" aria-pressed="${on ? "true" : "false"}" class="group mb-1 flex w-full cursor-pointer select-none items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-900 ${on ? "bg-white ring-1 ring-blue-500/30 dark:bg-slate-900" : ""}${opDeprecated ? " opacity-75" : ""}">
       <span class="flex h-4 w-4 shrink-0 items-center justify-center rounded border ${on ? "border-blue-500 bg-blue-500 text-white" : "border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-900"}">${on ? checkSvg : ""}</span>
       ${badge(e.method)}
       <span class="min-w-0 flex-1 truncate font-mono text-xs" title="${esc(e.path)}">${esc(e.path)}</span>
+      ${opDeprecated ? deprecatedBadge() : ""}
       <button type="button" data-url="${esc(endpointUrl(e))}" onclick="event.stopPropagation(); copy(this.dataset.url)" aria-label="Copy URL" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Copy URL">${copySvg}</button>
       <button type="button" data-id="${esc(e.id)}" onclick="event.stopPropagation(); solo(this.dataset.id)" class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-slate-400 opacity-70 hover:bg-slate-200 hover:text-slate-700 hover:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-800 dark:hover:text-slate-200" title="Show only this endpoint">Only</button>
     </div>`;
@@ -488,7 +499,11 @@
       const required = new Set(raw.required ?? []);
       const fields = Object.entries(raw.properties ?? {})
         .filter(([, schema]) => !(context === "request" && schema?.readOnly) && !(context === "response" && schema?.writeOnly))
-        .map(([name, schema]) => `${name}${required.has(name) ? "*" : "?"}:${compactSchema(schema, context, new Set(seen), shared)}`);
+        .map(([name, schema]) => {
+          const resolved = deref(schema);
+          const marker = `${isDeprecated(schema, resolved) ? "@" : ""}${required.has(name) ? "*" : "?"}`;
+          return `${name}${marker}:${compactSchema(schema, context, new Set(seen), shared)}`;
+        });
       if (raw.additionalProperties) {
         fields.push(`[key]:${raw.additionalProperties === true ? "any" : compactSchema(raw.additionalProperties, context, new Set(seen), shared)}`);
       }
@@ -509,9 +524,10 @@
     return typeof value;
   }
 
-  function parameterMarker(parameter) {
+  function parameterMarker(parameter, raw) {
     const required = parameter?.required || parameter?.in === "path";
-    return `${parameter?.name || "unknown"}${required ? "*" : "?"}`;
+    const deprecated = isDeprecated(raw, parameter);
+    return `${parameter?.name || "unknown"}${deprecated ? "@" : ""}${required ? "*" : "?"}`;
   }
 
   function bodyTable(schema, required, shared, example) {
@@ -528,7 +544,11 @@
     const requiredFields = new Set(schema.required ?? []);
     return Object.entries(schema.properties)
       .filter(([, field]) => !field?.readOnly)
-      .map(([name, field]) => `${name},${compactSchema(field, "request", new Set(), shared)},${requiredFields.has(name) ? "yes" : "no"}`)
+      .map(([name, field]) => {
+        const resolved = deref(field);
+        const label = isDeprecated(field, resolved) ? `${name}@` : name;
+        return `${label},${compactSchema(field, "request", new Set(), shared)},${requiredFields.has(name) ? "yes" : "no"}`;
+      })
       .join("\n");
   }
 
@@ -542,7 +562,7 @@
   function promptForEndpoint(endpoint, shared) {
     const op = endpoint.op;
     const summary = String(op.summary || op.operationId || "").replace(/\s+/g, " ").trim();
-    const lines = [`## ${endpoint.method.toUpperCase()} ${endpoint.path}${summary ? `: ${summary}` : ""}`];
+    const lines = [`## ${endpoint.method.toUpperCase()} ${endpoint.path}${summary ? `: ${summary}` : ""}${op.deprecated ? " (deprecated)" : ""}`];
     const labels = { header: "Headers", query: "Query", path: "Path", cookie: "Cookies", formData: "Form" };
     const grouped = new Map();
     for (const raw of endpoint.parameters ?? []) {
@@ -550,7 +570,7 @@
       if (!parameter || parameter.in === "body") continue;
       const label = labels[parameter.in] || parameter.in;
       if (!grouped.has(label)) grouped.set(label, []);
-      grouped.get(label).push(parameterMarker(parameter));
+      grouped.get(label).push(parameterMarker(parameter, raw));
     }
     for (const label of ["Headers", "Query", "Path", "Cookies", "Form"]) {
       if (grouped.has(label)) lines.push(`${label}: ${grouped.get(label).join(", ")}`);
@@ -584,7 +604,7 @@
       } else {
         lines.push(`Returns ${code}: ${String(response.description || "no body").replace(/\s+/g, " ").trim()}`);
       }
-      const responseHeaders = Object.entries(response.headers ?? {}).map(([name, header]) => parameterMarker({ ...deref(header), name, in: "header" }));
+      const responseHeaders = Object.entries(response.headers ?? {}).map(([name, header]) => parameterMarker({ ...deref(header), name, in: "header" }, header));
       if (responseHeaders.length) lines.push(`Response headers ${code}: ${responseHeaders.join(", ")}`);
     }
     return lines.join("\n");
@@ -594,7 +614,7 @@
     const selected = S.endpoints.filter(endpoint => S.selected.includes(endpoint.id));
     const shared = new Map();
     const endpoints = selected.map(endpoint => promptForEndpoint(endpoint, shared));
-    const intro = "API contract. Ask if anything is unclear.\nConventions: * = required, ? = optional (nullable).";
+    const intro = "API contract. Ask if anything is unclear.\nConventions: * = required, ? = optional, @ = deprecated.";
     const sharedBlock = shared.size ? `## Shared\n${[...shared.values()].map(schema => `${schema.name}: ${schema.definition}`).join("\n")}` : "";
     return [intro, sharedBlock, ...endpoints].filter(Boolean).join("\n\n");
   }
@@ -632,7 +652,7 @@
             <button type="button" data-id="${esc(e.id)}" onclick="toggleEndpoint(this.dataset.id)" title="Remove from selection" class="rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-200">✕</button>
           </div>
         </div>
-        <h2 class="mt-4 text-2xl font-semibold">${esc(e.op.summary || e.op.operationId || e.path)}</h2>
+        <h2 class="mt-4 flex flex-wrap items-center gap-2 text-2xl font-semibold">${esc(e.op.summary || e.op.operationId || e.path)}${e.op.deprecated ? deprecatedBadge() : ""}</h2>
         ${e.op.description ? `<p class="mt-2 max-w-3xl whitespace-pre-wrap text-sm leading-6 text-slate-500">${esc(e.op.description)}</p>` : ""}
         <div class="mt-4 flex items-center gap-2 text-xs text-slate-400"><span>Endpoint</span><code class="rounded bg-slate-100 px-2 py-1 dark:bg-slate-900">${esc(url)}</code></div>
       </div>
